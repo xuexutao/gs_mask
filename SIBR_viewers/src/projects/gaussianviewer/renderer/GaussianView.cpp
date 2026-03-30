@@ -39,6 +39,7 @@ struct RichPoint
 	float n[3];
 	SHs<D> shs;
 	float opacity;
+	float semantic;
 	Scale scale;
 	Rot rot;
 };
@@ -74,7 +75,8 @@ int loadPly(const char* filename,
 	std::vector<Scale>& scales,
 	std::vector<Rot>& rot,
 	sibr::Vector3f& minn,
-	sibr::Vector3f& maxx)
+	sibr::Vector3f& maxx,
+	std::vector<float>& semantics)
 {
 	std::ifstream infile(filename, std::ios_base::binary);
 
@@ -109,6 +111,7 @@ int loadPly(const char* filename,
 	scales.resize(count);
 	rot.resize(count);
 	opacities.resize(count);
+	semantics.resize(count);
 
 	// Gaussians are done training, they won't move anymore. Arrange
 	// them according to 3D Morton order. This means better cache
@@ -164,6 +167,7 @@ int loadPly(const char* filename,
 
 		// Activate alpha
 		opacities[k] = sigmoid(points[i].opacity);
+		semantics[k] = points[i].semantic;
 
 		shs[k].shs[0] = points[i].shs.shs[0];
 		shs[k].shs[1] = points[i].shs.shs[1];
@@ -360,23 +364,26 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 	std::vector<Scale> scale;
 	std::vector<float> opacity;
 	std::vector<SHs<3>> shs;
+	std::vector<float> semantics;
 	if (sh_degree == 0)
 	{
-		count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+		count = loadPly<0>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, semantics);
 	}
 	else if (sh_degree == 1)
 	{
-		count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+		count = loadPly<1>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, semantics);
 	}
 	else if (sh_degree == 2)
 	{
-		count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+		count = loadPly<2>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, semantics);
 	}
 	else if (sh_degree == 3)
 	{
-		count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax);
+		count = loadPly<3>(file, pos, shs, opacity, scale, rot, _scenemin, _scenemax, semantics);
 	}
-
+ 
+	_semantics = semantics;
+	_opacity_backup = opacity;
 	_boxmin = _scenemin;
 	_boxmax = _scenemax;
 
@@ -391,6 +398,8 @@ sibr::GaussianView::GaussianView(const sibr::BasicIBRScene::Ptr & ibrScene, uint
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(shs_cuda, shs.data(), sizeof(SHs<3>) * P, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&opacity_cuda, sizeof(float) * P));
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(opacity_cuda, opacity.data(), sizeof(float) * P, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&semantic_cuda, sizeof(float) * P));
+	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(semantic_cuda, semantics.data(), sizeof(float) * P, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL_ALWAYS(cudaMalloc((void**)&scale_cuda, sizeof(Scale) * P));
 	CUDA_SAFE_CALL_ALWAYS(cudaMemcpy(scale_cuda, scale.data(), sizeof(Scale) * P, cudaMemcpyHostToDevice));
 
@@ -465,6 +474,20 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget & dst, const sibr::Came
 	}
 	else
 	{
+		// Apply semantic highlighting if enabled
+		if (_highlightEnabled)
+		{
+			std::vector<float> filtered_opacity(count);
+			for (int i = 0; i < count; ++i)
+			{
+				if (std::abs(_semantics[i] - _semanticTarget) < 1e-5)
+					filtered_opacity[i] = _opacity_backup[i];
+				else
+					filtered_opacity[i] = 0.0f;
+			}
+			CUDA_SAFE_CALL(cudaMemcpy(opacity_cuda, filtered_opacity.data(), sizeof(float) * count, cudaMemcpyHostToDevice));
+		}
+
 		// Convert view and projection to target coordinate system
 		auto view_mat = eye.view();
 		auto proj_mat = eye.viewproj();
@@ -526,6 +549,12 @@ void sibr::GaussianView::onRenderIBR(sibr::IRenderTarget & dst, const sibr::Came
 			boxmax
 		);
 
+		// Restore original opacity if highlighting was applied
+		if (_highlightEnabled)
+		{
+			CUDA_SAFE_CALL(cudaMemcpy(opacity_cuda, _opacity_backup.data(), sizeof(float) * count, cudaMemcpyHostToDevice));
+		}
+
 		if (!_interop_failed)
 		{
 			// Unmap OpenGL resource for use with OpenGL
@@ -572,6 +601,18 @@ void sibr::GaussianView::onGUI()
 		ImGui::SliderFloat("Scaling Modifier", &_scalingModifier, 0.001f, 1.0f);
 	}
 	ImGui::Checkbox("Fast culling", &_fastCulling);
+
+	ImGui::Checkbox("Highlight by semantic", &_highlightEnabled);
+	if (_highlightEnabled)
+	{
+		ImGui::InputFloat("Semantic target", &_semanticTarget);
+		// Count matching points
+		int matched = 0;
+		for (float s : _semantics)
+			if (std::abs(s - _semanticTarget) < 1e-5)
+				matched++;
+		ImGui::Text("Matched points: %d / %d", matched, count);
+	}
 
 	ImGui::Checkbox("Crop Box", &_cropping);
 	if (_cropping)
@@ -637,6 +678,7 @@ sibr::GaussianView::~GaussianView()
 	cudaFree(scale_cuda);
 	cudaFree(opacity_cuda);
 	cudaFree(shs_cuda);
+	cudaFree(semantic_cuda);
 
 	cudaFree(view_cuda);
 	cudaFree(proj_cuda);

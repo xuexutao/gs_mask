@@ -101,6 +101,7 @@ namespace sibr {
 		float* scale_cuda;
 		float* opacity_cuda;
 		float* shs_cuda;
+		float* semantic_cuda;
 		int* rect_cuda;
 
 		GLuint imageBuffer;
@@ -116,10 +117,14 @@ namespace sibr {
 		float* background_cuda;
 
 		float _scalingModifier = 1.0f;
+		bool _highlightEnabled = false;
+		float _semanticTarget = 0.0f;
 		GaussianData* gData;
 
 		bool _interop_failed = false;
 		std::vector<char> fallback_bytes;
+		std::vector<float> _semantics;
+		std::vector<float> _opacity_backup;
 		float* fallbackBufferCuda = nullptr;
 		bool accepted = false;
 
