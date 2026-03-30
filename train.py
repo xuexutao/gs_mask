@@ -28,13 +28,14 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, semantic_labels_path=None, mask_dir=None):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, semantic_labels_path=None, mask_dir=None, refine_args=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -60,6 +61,97 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if semantic_labels is not None:
         print(f"[DEBUG train.py] Calling assign_semantic_labels with {len(semantic_labels)} labels")
         scene.assign_semantic_labels_multi(semantic_labels)
+        
+        # 语义标签细化（如果启用）
+        if refine_args is not None and refine_args.get('enabled', False):
+            print("Refining semantic labels...")
+            # 获取高斯位置和语义标签
+            xyz = gaussians.get_xyz.detach().cpu().numpy()
+            semantic = gaussians._semantic.cpu().numpy()
+            
+            # 获取尺度和不透明度（如果可用）
+            scale_mag = None
+            opacity = None
+            if hasattr(gaussians, 'get_scaling'):
+                scales = gaussians.get_scaling.detach().cpu().numpy()
+                scale_mag = np.linalg.norm(scales, axis=1)
+            if hasattr(gaussians, 'get_opacity'):
+                opacity = gaussians.get_opacity.detach().cpu().numpy().flatten()
+            
+            # 1. 基于空间聚类移除离群点
+            if refine_args.get('use_clustering', True):
+                eps = refine_args.get('eps', 0.1)
+                min_samples = refine_args.get('min_samples', 10)
+                min_cluster_size = refine_args.get('min_cluster_size', 50)
+                
+                unique_labels = np.unique(semantic)
+                new_semantic = semantic.copy()
+                
+                for cat in unique_labels:
+                    if cat == -1:
+                        continue
+                    mask = semantic == cat
+                    if np.sum(mask) < min_cluster_size:
+                        # 类别点数太少，直接标记为未分类
+                        new_semantic[mask] = -1
+                        continue
+                    
+                    cat_points = xyz[mask]
+                    # 使用DBSCAN聚类（需要sklearn）
+                    try:
+                        from sklearn.cluster import DBSCAN
+                        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(cat_points)
+                        cluster_labels = clustering.labels_
+                        # 统计每个聚类的大小
+                        unique_clusters, counts = np.unique(cluster_labels[cluster_labels != -1], return_counts=True)
+                        if len(unique_clusters) == 0:
+                            # 所有点都是噪声，标记为未分类
+                            new_semantic[mask] = -1
+                            continue
+                        
+                        # 保留点数大于阈值的聚类
+                        large_clusters = unique_clusters[counts >= min_cluster_size]
+                        if len(large_clusters) == 0:
+                            # 没有大聚类，保留最大的聚类
+                            largest_cluster = unique_clusters[np.argmax(counts)]
+                            large_clusters = [largest_cluster]
+                        
+                        # 创建新的掩码：只保留大聚类中的点
+                        keep_mask = np.isin(cluster_labels, large_clusters)
+                        # 将不属于大聚类的点标记为-1
+                        cat_indices = np.where(mask)[0]
+                        for idx, keep in zip(cat_indices, keep_mask):
+                            if not keep:
+                                new_semantic[idx] = -1
+                        
+                    except ImportError:
+                        print("Warning: sklearn not installed, skipping clustering")
+                
+                semantic = new_semantic
+            
+            # 2. 基于尺度过滤
+            scale_threshold = refine_args.get('scale_threshold', 2.0)
+            if scale_mag is not None:
+                large_scale = scale_mag > scale_threshold
+                semantic[large_scale] = -1
+                print(f"Filtered {np.sum(large_scale)} points with scale > {scale_threshold}")
+            
+            # 3. 基于不透明度过滤
+            opacity_threshold = refine_args.get('opacity_threshold', 0.5)
+            if opacity is not None:
+                low_opacity = opacity < opacity_threshold
+                # 注意：不透明度较低的点可能是前景的透明部分，不一定属于背景
+                # 这里我们只过滤非常不透明的点（例如 >0.5），但用户可能希望调整
+                # 暂时注释掉，因为可能过于激进
+                # semantic[low_opacity] = -1
+                # print(f"Filtered {np.sum(low_opacity)} points with opacity < {opacity_threshold}")
+            
+            # 将更新后的语义标签写回高斯模型
+            gaussians._semantic = torch.tensor(semantic, dtype=torch.long, device='cuda')
+            
+            # 统计细化后的标签分布
+            assigned = (semantic != -1).sum()
+            print(f"After refinement: {assigned}/{len(semantic)} points labeled ({assigned/len(semantic)*100:.1f}%)")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -267,6 +359,18 @@ if __name__ == "__main__":
                         help="Path to labels.json file containing semantic label mapping")
     parser.add_argument("--mask_dir", type=str, default=None,
                         help="Path to mask directory (e.g., data/gs_data/room/images_4/masks_sam)")
+    parser.add_argument("--refine_semantic", action="store_true", default=False,
+                        help="Enable semantic label refinement after assignment")
+    parser.add_argument("--refine_eps", type=float, default=0.1,
+                        help="DBSCAN epsilon for clustering")
+    parser.add_argument("--refine_min_samples", type=int, default=10,
+                        help="DBSCAN min_samples for clustering")
+    parser.add_argument("--refine_min_cluster_size", type=int, default=50,
+                        help="Minimum cluster size to keep")
+    parser.add_argument("--refine_scale_threshold", type=float, default=2.0,
+                        help="Scale threshold for background filtering")
+    parser.add_argument("--refine_opacity_threshold", type=float, default=0.5,
+                        help="Opacity threshold for background filtering")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +383,22 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.semantic_labels, args.mask_dir)
+    
+    # 构建语义标签细化参数
+    refine_args = None
+    if args.refine_semantic:
+        refine_args = {
+            'enabled': True,
+            'eps': args.refine_eps,
+            'min_samples': args.refine_min_samples,
+            'min_cluster_size': args.refine_min_cluster_size,
+            'scale_threshold': args.refine_scale_threshold,
+            'opacity_threshold': args.refine_opacity_threshold,
+            'use_clustering': True
+        }
+        print(f"Semantic refinement enabled with parameters: {refine_args}")
+    
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.semantic_labels, args.mask_dir, refine_args)
 
     # All done
     print("\nTraining complete.")

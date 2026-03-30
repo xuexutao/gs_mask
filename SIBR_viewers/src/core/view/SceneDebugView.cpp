@@ -326,7 +326,10 @@ namespace sibr
 		//user camera transform update
 		sibr::Transform3f scaled = _userCurrentCam->getCamera().transform();
 		scaled.scale(_userCameraScaling);
-		getMeshData("scene cam").setTransformation(scaled.matrix());
+		// getMeshData("scene cam").setTransformation(scaled.matrix());
+		sibr::Matrix4f mat = scaled.matrix();
+		getMeshData("scene cam").setTransformation(mat);
+
 
 		// update input camera (path) scales
 		if (_pathScaling != _lastPathScaling) {
